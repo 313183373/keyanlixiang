@@ -69,7 +69,7 @@ function getAllData() {
             let yibuCnt = 0;
             async.mapLimit(items, 10, async function (item) {
                 yibuCnt++;
-                let query = '"' + item.split('&').join('""') + '"';
+                let query = '"' + item.split('&').join('"+"') + '"'; //百度的内容
                 let res = await request.get('http://www.baidu.com/s')
                     .query({wd: `${query}`})
                     .catch(function (err) {
