@@ -6,6 +6,7 @@ const cheerio = require('cheerio');
 const async = require('async');
 const fs = require('fs');
 const Item = require('./lib/item');
+const RedisSaver = require('./lib/redisSaver');
 
 const client = redis.createClient();
 
@@ -19,50 +20,40 @@ client.on("error", function (err) {
 // const sheet = workSheetsFromFile[0];
 // const data = sheet.data;
 
-// 将获取到的数据存取到redis中（包括组合的）
-// saveSingleData(data);
-// savecombileData(data);
+// 将获取到的词条存取到redis中（包括组合的）
+// let redisSaver = new RedisSaver(client);
+// redisSaver.saveData(data);
+
 
 // 从redis中获取所有数据，然后查询结果数，并放到mongdb中
-getAllData();
+// getAllData();
 
-function saveSingleData(data) {
-    for (let i = 0; i < data.length; i++) {
-        client.rpush('items', JSON.stringify({name: data[i][0]}), redis.print);
-    }
-}
+// fixNullNumber();
 
-function savecombileData(data) {
-    for (let i = 0; i < data.length; i++) {
-        for (let j = i + 1; j < data.length; j++) {
-            client.rpush('items', JSON.stringify({name: data[i][0] + ' ' + data[j][0]}), redis.print);
-        }
-    }
-}
+// saveDataToExcel('output.xlsx');
 
 function getAllData() {
-    let lostItems = [];
     client.lrange('items', 0, -1, function (err, items) {
         if (err) throw err;
         let n = 0;
         (async () => {
 
+            // 获取已经获得的词条
             let itemsIHave = await Item.find({});
             itemsIHave = itemsIHave.map(value => value.name);
-            console.log('Items I have: ' + itemsIHave.length);
+            console.log('items I have: ' + itemsIHave.length);
 
             // 获取重复词条数目
             let set = new Set(itemsIHave);
             console.log('repeat items I have: ' + Number(itemsIHave.length - set.size));
 
             // 滤除重复词条
-            console.log('All items: ' + items.length);
-            items = items.map(value => JSON.parse(value))
-                .filter(value => !itemsIHave.includes(value.name));
-            console.log('Filter items: ' + items.length);
+            console.log('all items: ' + items.length);
+            items = items.filter(value => !itemsIHave.includes(value));
+            console.log('rest items: ' + items.length);
 
 
-            // 测试是否真的重复（发现是真的重复了，但是不知道为什么会出现重复词条）
+            // 测试是否真的重复
             // let num = 0
             // items.forEach(function (value, index, arr) {
             //     Item.find({name: value.name}, function (err, result) {
@@ -77,9 +68,10 @@ function getAllData() {
             // 爬取
             let yibuCnt = 0;
             async.mapLimit(items, 10, async function (item) {
-                yibuCnt ++;
+                yibuCnt++;
+                let query = '"' + item.split('&').join('""') + '"';
                 let res = await request.get('http://www.baidu.com/s')
-                    .query({wd: item.name})
+                    .query({wd: `${query}`})
                     .catch(function (err) {
                         if (err) console.error('request Error :' + err);
                     });
@@ -88,24 +80,23 @@ function getAllData() {
                     let $ = cheerio.load(res.text);
                     let cnt = $('.head_nums_cont_inner .nums').text().replace(/[^0-9]/g, '');
                     let i = new Item({
-                        name: item.name,
+                        name: item,
                         number: cnt,
                         baikeUrl: undefined
                     });
                     i.save(function (err) {
                         if (err) {
-                            console.error(`${item.name} 存储出错!`);
+                            console.error(`${item} 存储出错!`);
                             console.error(err);
                         } else {
-                            console.log(`${n}:${item.name}的结果数为:${cnt},并发数为${yibuCnt}`);
+                            console.log(`${n}:${item}的结果数为:${cnt},并发数为${yibuCnt}`);
                         }
-                        yibuCnt --;
+                        yibuCnt--;
                     });
                     return cnt;
                 } else {
-                    console.log(`${item.name}没有获取到!`);
-                    lostItems.push(item);
-                    yibuCnt --;
+                    console.log(`${item}没有获取到!`);
+                    yibuCnt--;
                 }
             }, (err, results) => {
                 if (err) throw err;
@@ -115,15 +106,46 @@ function getAllData() {
     });
 }
 
-function saveDataToExcel() {
-    (async()=>{
+function saveDataToExcel(name) {
+    (async () => {
         let itemsIHave = await Item.find({});
-        itemsIHave = itemsIHave.map(value => value.name);
+        itemsIHave = itemsIHave.map(value => [value.name, value.number]);
         // 导出已有的项目到excel中
         let buffer = xlsx.build([{
-            name:'sheet1',
-            data:itemsIHave
+            name: 'sheet1',
+            data: itemsIHave
         }]);
-        fs.writeFileSync('output.xlsx',buffer,{'flag':'w'});
+        fs.writeFileSync(name, buffer, {'flag': 'w'});
+        console.log('saved!');
+    })();
+}
+
+function fixNullNumber() {
+    (async () => {
+        let items = await Item.find({number: null});
+        console.log(`bad items: ${items.length}`);
+        async.mapLimit(items, 10, async function (item) {
+                let query = '"' + item.name.split('&').join('""') + '"';
+                let res = await request.get('http://www.baidu.com/s')
+                    .query({wd: query})
+                    .catch(function (err) {
+                        if (err) console.error('request Error :' + err);
+                    });
+                if (res && res.text) {
+                    let $ = cheerio.load(res.text);
+                    let cnt = $('.head_nums_cont_inner .nums').text().replace(/[^0-9]/g, '');
+                    Item.update({_id: item._id}, {$set: {number: cnt}}, function (err, result) {
+                        if (err) throw err;
+                        console.log(`${item.name}更新number为${cnt}`);
+                        return cnt;
+                    });
+                } else {
+                    console.log(`${item.name}获取失败!`);
+                }
+            }, (err, result) => {
+                if (err) throw err;
+                console.log(result);
+            }
+        )
     })();
 }
